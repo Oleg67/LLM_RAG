@@ -1,0 +1,45 @@
+﻿GNN = graph neural network
+SRGNN = sparse representation GNN
+Some questions apply to multiple roles, I listed them only once.
+Don’t forget to add Supplementary Information, and the dataset paper to the demo
+Some questions can’t be answered from the papers & SI
+Role: wants to use the data for his own study
+* Which materials are in the dataset?
+* How many structures are there in the dataset?
+* How to obtain the dataset?
+* What is the dataset license?
+* What is the data format?
+* How to read the dataset?
+* How to browse the dataset?
+* Can I work with the dataset without Python?
+* How to obtain the raw VASP files?
+* What were the settings used for the DFT computations?
+* How well the DFT calculations correspond to experiment?
+* How to cite the dataset?
+Role: wants to improve the algorithm
+* What was the procedure for SRGNN quality evaluation?
+* How is SRGNN different from the baselines?
+* What are the limitations of SRGNN?
+* What is the core idea of SRGNN?
+* How to run the code?
+* Which frameworks were used for SRGNN implementation?
+* Can SRGNN be developed on a CPU, not a GPU?
+* What is the code license?
+* How to cite the code?
+Role: wants to use the algorithm for his own data.
+* Which materials has the SRGNN been trained on?
+* Which materials can the SRGNN be trained on?
+* Which defect types can the SRGNN be trained on?
+* How many structures are needed for SRGNN training?
+* Can SRGNN handle 3D materials?
+* How much computational resources does SRGNN require for training?
+* What is the inference speed of a SRGNN?
+Role: experimental physicist
+* Which properties can be predicted using SRGNN?
+* What was the quality of SRGNN for each property and material?
+* Can pre-trained SRGNN be used out-of-the-box?
+* How well do SRGNN results correspond to experiment?
+* Can I use SRGNN in place of DFT?
+Role: applied researcher
+* How can I use SRGNN to find materials for solar panels/transistors/photodetectors/single photon emitters/quantum computers?
+* Is SRGNN patented?
