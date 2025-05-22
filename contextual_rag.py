@@ -731,119 +731,150 @@ class ContextualRAG:
         
         # Normalize the embedding
         return normalize(query_embedding.reshape(1, -1)).astype('float32')
-    
-    def process_query(self, 
-                     query: str, 
-                     top_k: int = 5, 
-                     filter_doc_ids: Optional[List[str]] = None,
-                     keyword_weight: float = 0.7,
-                     chunk_weight: float = 0.3) -> List[Dict[str, Any]]:
+
+    def process_query(self,
+                      query: str,
+                      top_k: int = 5,
+                      filter_doc_ids: Optional[List[str]] = None,
+                      mode: str = "hybrid",
+                      keyword_weight: float = 0.7,
+                      chunk_weight: float = 0.3) -> List[Dict[str, Any]]:
         """
-        Process a query using both keyword and chunk embeddings.
-        
+        Process a query using different retrieval modes.
+
         Args:
             query: Text query
             top_k: Number of results to return
             filter_doc_ids: Optional list of document IDs to filter results
-            keyword_weight: Weight for keyword similarity (0-1)
-            chunk_weight: Weight for chunk similarity (0-1)
-            
+            mode: Retrieval mode - "hybrid" (keywords and chunks) or "keywords_only"
+            keyword_weight: Weight for keyword similarity (0-1) when in hybrid mode
+            chunk_weight: Weight for chunk similarity (0-1) when in hybrid mode
+
         Returns:
             List of dicts with relevant chunks and metadata
         """
-        # Normalize weights
-        total_weight = keyword_weight + chunk_weight
-        keyword_weight = keyword_weight / total_weight
-        chunk_weight = chunk_weight / total_weight
-        
+        # Validate mode
+        if mode not in ["hybrid", "keywords_only"]:
+            raise ValueError("Mode must be either 'hybrid' or 'keywords_only'")
+
+        # Check if vector DBs exist
+        if self.keyword_db is None:
+            raise ValueError("Keyword database has not been created. Call make_db first.")
+
+        if mode == "hybrid" and self.chunk_db is None:
+            raise ValueError("Chunk database has not been created but required for hybrid mode. Call make_db first.")
+
         # Generate query embedding
         query_embedding = self.get_query_embedding(query)
-        
-        # Check if vector DBs exist
-        if self.keyword_db is None or self.chunk_db is None:
-            raise ValueError("Vector databases have not been created. Call make_db first.")
-        
+
         # Get more results to account for filtering and combination
         search_k = top_k * 5
-        
-        # Search in both keyword and chunk databases
-        keyword_scores, keyword_indices = self.keyword_db.search(query_embedding, search_k)
-        chunk_scores, chunk_indices = self.chunk_db.search(query_embedding, search_k)
-        
+
         # Extract important terms from query for highlighting in results
         query_terms = self.extract_query_terms(query)
         print(f"Query terms: {query_terms}")
-        
-        # Combine results from both keyword and chunk searches
-        combined_scores = defaultdict(float)
-        
-        # Process keyword search results
-        for i, idx in enumerate(keyword_indices[0]):
-            if idx in self.id_to_chunk:
-                chunk_id = self.id_to_chunk[idx]
-                
+
+        # Process based on mode
+        if mode == "keywords_only":
+            # Search only in keyword database
+            keyword_scores, keyword_indices = self.keyword_db.search(query_embedding, search_k)
+
+            # Map keyword results to chunks
+            combined_scores = defaultdict(float)
+
+            for i, idx in enumerate(keyword_indices[0]):
+                if idx in self.id_to_chunk:
+                    chunk_id = self.id_to_chunk[idx]
+
+                    # Skip if outside filter
+                    if (filter_doc_ids and
+                            chunk_id < len(self.chunk_metadata) and
+                            self.chunk_metadata[chunk_id].doc_id not in filter_doc_ids):
+                        continue
+
+                    # Add score for this chunk
+                    combined_scores[chunk_id] += float(keyword_scores[0][i])
+
+        else:  # hybrid mode
+            # Normalize weights
+            total_weight = keyword_weight + chunk_weight
+            keyword_weight = keyword_weight / total_weight
+            chunk_weight = chunk_weight / total_weight
+
+            # Search in both keyword and chunk databases
+            keyword_scores, keyword_indices = self.keyword_db.search(query_embedding, search_k)
+            chunk_scores, chunk_indices = self.chunk_db.search(query_embedding, search_k)
+
+            # Combine results from both keyword and chunk searches
+            combined_scores = defaultdict(float)
+
+            # Process keyword search results
+            for i, idx in enumerate(keyword_indices[0]):
+                if idx in self.id_to_chunk:
+                    chunk_id = self.id_to_chunk[idx]
+
+                    # Skip if outside filter
+                    if (filter_doc_ids and
+                            chunk_id < len(self.chunk_metadata) and
+                            self.chunk_metadata[chunk_id].doc_id not in filter_doc_ids):
+                        continue
+
+                    # Add normalized score for this chunk
+                    combined_scores[chunk_id] += keyword_weight * float(keyword_scores[0][i])
+
+            # Process chunk search results
+            for i, chunk_id in enumerate(chunk_indices[0]):
                 # Skip if outside filter
-                if (filter_doc_ids and 
-                    chunk_id < len(self.chunk_metadata) and 
-                    self.chunk_metadata[chunk_id].doc_id not in filter_doc_ids):
+                if (filter_doc_ids and
+                        chunk_id < len(self.chunk_metadata) and
+                        self.chunk_metadata[chunk_id].doc_id not in filter_doc_ids):
                     continue
-                
+
                 # Add normalized score for this chunk
-                combined_scores[chunk_id] += keyword_weight * float(keyword_scores[0][i])
-    
-        # Process chunk search results
-        for i, chunk_id in enumerate(chunk_indices[0]):
-            # Skip if outside filter
-            if (filter_doc_ids and 
-                chunk_id < len(self.chunk_metadata) and 
-                self.chunk_metadata[chunk_id].doc_id not in filter_doc_ids):
-                continue
-        
-            # Add normalized score for this chunk
-            combined_scores[chunk_id] += chunk_weight * float(chunk_scores[0][i])
-    
+                combined_scores[chunk_id] += chunk_weight * float(chunk_scores[0][i])
+
         # Sort chunks by combined score
         sorted_chunks = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-    
+
         # Build final results
         results = []
-    
+
         for chunk_id, score in sorted_chunks[:top_k]:
             if chunk_id >= len(self.chunk_texts):
                 continue
-            
+
             # Get chunk metadata
             metadata = self.chunk_metadata[chunk_id]
             chunk_text = self.chunk_texts[chunk_id]
-            
+
             # Find keywords associated with this chunk
             chunk_keywords = set()
             for key, val in self.id_to_chunk.items():
                 if val == chunk_id:
                     keyword, _, _ = self.id_to_keyword_context[key]
                     chunk_keywords.add(keyword)
-            
+
             # Find relevant terms in this chunk
             chunk_lower = chunk_text.lower()
-            
+
             # Check for query term presence in the chunk
-            relevant_terms = [term for term in query_terms 
-                            if term in chunk_lower]
+            relevant_terms = [term for term in query_terms
+                              if term in chunk_lower]
 
             # Calculate term frequency in the chunk for ranking
             term_frequencies = {}
             for term in relevant_terms:
                 # Count approximate instances (might catch substrings too)
                 term_frequencies[term] = chunk_lower.count(term)
-            
+
             # Sort terms by frequency
             sorted_terms = sorted(
-                term_frequencies.items(), 
-                key=lambda x: x[1], 
+                term_frequencies.items(),
+                key=lambda x: x[1],
                 reverse=True
             )
             most_relevant_terms = [term for term, freq in sorted_terms if freq > 0]
-            
+
             results.append({
                 "chunk_text": chunk_text,
                 "keywords": list(chunk_keywords),
@@ -854,7 +885,7 @@ class ContextualRAG:
                 "chunk_index": metadata.chunk_index,
                 "relevant_terms": most_relevant_terms
             })
-        
+
         return results
 
     def get_all_unique_keywords(self) -> Dict[str, Dict[str, int]]:
