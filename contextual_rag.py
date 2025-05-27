@@ -62,7 +62,7 @@ class ContextualRAG:
         embedding_model_name: str = "BAAI/bge-base-en-v1.5", 
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
-        context_window: int = 50,
+        context_window: int = 200,
         device: Optional[str] = None
     ):
         """
@@ -341,7 +341,7 @@ class ContextualRAG:
     def get_query_keyword_emb(self,
                               query_terms: List[str],
                               query: str = None
-    ) -> Dict[str, np.ndarray]:
+                              ) -> Dict[str, np.ndarray]:
         """
         Generate embeddings for query keywords, optionally with query context.
 
@@ -366,27 +366,21 @@ class ContextualRAG:
                 text_to_embed = keyword
 
             try:
-                # Tokenize the text
-                inputs = self.tokenizer(
-                    text_to_embed,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                ).to(self.device)
+                # Step 1: Get token-level embeddings using _get_embedding
+                token_embeddings_np, _ = self._get_embedding(text_to_embed, normalize=True)
 
-                # Generate embedding using the model
-                with torch.no_grad():
-                    outputs = self.embedding_model(**inputs)
+                # Convert numpy array to torch tensor for pooling
+                token_embeddings = torch.tensor(token_embeddings_np)
 
-                    # Use pooler output or mean of last hidden state
-                    if hasattr(outputs, 'pooler_output'):
-                        embedding = outputs.pooler_output[0].cpu().numpy()
-                    else:
-                        embedding = outputs.last_hidden_state[0].mean(dim=0).cpu().numpy()
+                # Step 2: Pool token embeddings to get a single vector using _pooler_embeddings
+                # We put the tensor in a list since _pooler_embeddings expects a list of tensors
+                pooled_embedding = self._pooler_embeddings([token_embeddings], pooling_strategy="mean")[0]
 
-                    # Store the embedding in the dictionary
-                    keyword_embeddings[keyword] = embedding.reshape(1, -1).astype('float32')
+                # Convert to numpy array and ensure correct shape and type
+                embedding = pooled_embedding.cpu().numpy().reshape(1, -1).astype('float32')
+
+                # Store the embedding in the dictionary
+                keyword_embeddings[keyword] = embedding
 
             except Exception as e:
                 print(f"Error generating keyword embedding for '{keyword}': {e}")
@@ -409,10 +403,10 @@ class ContextualRAG:
     ) -> Tuple[List[torch.Tensor], List[List[int]]]:
         """
         Generate token-level embeddings for each chunk.
-        
+
         Args:
             chunks: List of text chunks
-            
+
         Returns:
             Tuple containing:
             - List of tensors with token embeddings for each chunk
@@ -420,73 +414,49 @@ class ContextualRAG:
         """
         chunk_embeddings = []
         token_ids_list = []
-        
+
         for chunk in tqdm(chunks, desc="Generating chunk embeddings"):
-            # Tokenize the text
-            inputs = self.tokenizer(chunk, return_tensors="pt", padding=True, 
-                                  truncation=True, max_length=512).to(self.device)
-            
-            # Store token IDs for this chunk
-            token_ids = inputs['input_ids'][0].cpu().tolist()
-            token_ids_list.append(token_ids)
-            
-            # Get token embeddings from the full model output
-            with torch.no_grad():
-                outputs = self.embedding_model(**inputs, output_hidden_states=True)
-                
-                # Get the embeddings from the last hidden state
-                # This contains embeddings for all tokens (including special tokens)
-                token_embeddings = outputs.hidden_states[-1][0].cpu()
-                
+            # Use the _get_embedding method to get token embeddings and token IDs
+            token_embeddings_np, token_ids_np = self._get_embedding(chunk)
+
+            # Convert numpy arrays to the appropriate format
+            token_embeddings = torch.tensor(token_embeddings_np)
+            token_ids = token_ids_np.tolist()
+
+            # Store the results
             chunk_embeddings.append(token_embeddings)
-        
+            token_ids_list.append(token_ids)
+
         print(f"Generated token embeddings for {len(chunk_embeddings)} chunks")
+        print(f"Generated token IDs for {len(token_ids_list)} chunks")
+        print(f"Token embedding shape: {chunk_embeddings[0].shape} and Type: {type(chunk_embeddings[0])}")
         return chunk_embeddings, token_ids_list
-    
+
     def get_full_chunk_embeddings(self,
-                                  chunks: List[str]
-    ) -> np.ndarray:
+                                  token_embeddings_list: List[torch.Tensor],
+                                  pooling_strategy: str = "mean"
+                                  ) -> List[torch.Tensor]:
+
         """
-        Generate embeddings for entire chunks.
-        
+        Pool token-level embeddings into single embeddings for each chunk.
+
         Args:
-            chunks: List of text chunks
-            
+            token_embeddings_list: List of 2D tensors with token embeddings for each chunk
+            pooling_strategy: Strategy to use for pooling. Options:
+                             - "mean": Use mean of all token embeddings
+                             - "pooler": Use the model's pooler_output (if available)
+                             - "cls": Use the CLS token embedding
+
         Returns:
-            Array of chunk embeddings
+            List of 1D tensors with a single embedding vector for each chunk
         """
-        chunk_embeddings = []
-        
-        for chunk in tqdm(chunks, desc="Generating full chunk embeddings"):
-            # Tokenize the text
-            inputs = self.tokenizer(
-                chunk, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=512
-            ).to(self.device)
-            
-            # Get embeddings from the model
-            with torch.no_grad():
-                outputs = self.embedding_model(**inputs)
-                
-                # Use pooler output (if available) or mean of last hidden state
-                if hasattr(outputs, 'pooler_output'):
-                    embedding = outputs.pooler_output[0].cpu().numpy()
-                else:
-                    embedding = outputs.last_hidden_state[0].mean(dim=0).cpu().numpy()
-                
-                chunk_embeddings.append(embedding)
-        
-        # Convert to numpy array
-        embeddings_array = np.array(chunk_embeddings).astype('float32')
-        
-        # Normalize embeddings
-        normalized_embeddings = normalize(embeddings_array)
-        
-        print(f"Generated embeddings for {len(normalized_embeddings)} chunks")
-        return normalized_embeddings
+
+        # Pool token-level embeddings into chunk-level embeddings
+        chunk_embeddings = self._pooler_embeddings(token_embeddings_list, pooling_strategy)
+
+        print(f"Generated {len(chunk_embeddings)} chunk embeddings using {pooling_strategy} pooling")
+
+        return chunk_embeddings
     
     def get_context_window(self, 
                           token_ids: List[int], 
@@ -622,6 +592,129 @@ class ContextualRAG:
             keyword_embeddings.append(emb)
 
         return keyword_context_doc_embeddings, keyword_contexts, keyword_embeddings
+
+    def _get_embedding(self,
+                       text,
+                       normalize: bool = False
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate an embedding vector for the provided text using the model's tokenizer and embedding model.
+
+        This function tokenizes the input text, processes it through the embedding model,
+        and extracts a numerical vector representation. It handles both models that return
+        pooler_output and those that only provide last_hidden_state.
+
+        Args:
+            text (str): The text to generate an embedding for. Can be a sentence, paragraph,
+                        or any text content that needs to be converted to a vector representation.
+            normalize (bool): Whether to normalize the token embeddings to unit length (default: False)
+
+        Returns:
+            numpy.ndarray: A 2-dimensional float numpy array containing the
+                                      embedding vectors of each token. The dimensionality depends on the underlying embedding model and number of tokens
+            numpy.ndarray: A 1-dimensional int numpy array containing the
+                                      tokens indices
+        """
+        # Tokenize the text
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_token_type_ids=False,
+            return_attention_mask=True
+        )
+
+        # Get the token IDs for return
+        token_ids = inputs['input_ids'][0].numpy()
+
+        # Move inputs to the correct device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Generate embedding using the model
+        with torch.no_grad():
+            self.embedding_model.eval()
+            outputs = self.embedding_model(**inputs)
+
+            # Extract token embeddings from the model output
+            if hasattr(outputs, 'last_hidden_state'):
+                # Get the embeddings for all tokens
+                token_embeddings = outputs.last_hidden_state[0].cpu()
+            elif hasattr(outputs, 'hidden_states'):
+                # Some models provide hidden states instead
+                token_embeddings = outputs.hidden_states[-1][0].cpu()
+            else:
+                # Fallback - model may have custom output format
+                token_embeddings = outputs[0].cpu()
+
+            # Normalize embeddings if requested
+            if normalize:
+                # Compute L2 norm along the embedding dimension
+                norms = torch.norm(token_embeddings, p=2, dim=1, keepdim=True)
+                # Normalize embeddings (add small epsilon to avoid division by zero)
+                token_embeddings = token_embeddings / (norms + 1e-8)
+
+            # Convert to numpy for return
+            token_embeddings = token_embeddings.numpy()
+        #print(f"Embeddins shape: {token_embeddings.shape} tokens shape: {token_ids.shape}")
+        return token_embeddings, token_ids
+
+    def _pooler_embeddings(self,
+                           token_embeddings_list: List[torch.Tensor],
+                           pooling_strategy: str = "mean"
+    ) -> List[torch.Tensor]:
+        """
+        Pool token-level embeddings into single embeddings for each chunk.
+
+        This method converts a list of 2D tensors (token-level embeddings) into a list of 1D tensors
+        (chunk-level embeddings) by applying a pooling strategy such as mean pooling or using
+        the model's pooler output if available.
+
+        Args:
+            token_embeddings_list: List of 2D tensors with token embeddings for each chunk
+            pooling_strategy: Strategy to use for pooling. Options:
+                             - "mean": Use mean of all token embeddings
+                             - "pooler": Use the model's pooler_output (if available)
+                             - "cls": Use the CLS token embedding
+
+        Returns:
+            List of 1D tensors with a single embedding vector for each chunk
+        """
+        pooled_embeddings = []
+
+        for token_embeddings in token_embeddings_list:
+            if pooling_strategy == "mean":
+                # Mean pooling: average all token embeddings
+                pooled_embedding = torch.mean(token_embeddings, dim=0)
+
+            elif pooling_strategy == "cls":
+                # CLS pooling: use the first token (typically the CLS token)
+                pooled_embedding = token_embeddings[0]
+
+            elif pooling_strategy == "pooler" and hasattr(self.embedding_model, "pooler"):
+                # Try to use the model's pooler if available
+                # Note: This would typically need to be done during the original forward pass,
+                # so we're including this option but it may require modification based on how
+                # the model is being used
+
+                # Re-process the inputs through the model to get the pooler output
+                # This is a placeholder implementation - the actual implementation would
+                # depend on how the model is structured
+                try:
+                    # This assumes token_embeddings has a batch dimension
+                    pooled_embedding = self.embedding_model.pooler(token_embeddings.unsqueeze(0)).squeeze(0)
+                except:
+                    # Fall back to mean pooling if pooler fails
+                    pooled_embedding = torch.mean(token_embeddings, dim=0)
+                    print("Warning: Pooler strategy failed, falling back to mean pooling.")
+            else:
+                # Default to mean pooling if the strategy is not recognized
+                pooled_embedding = torch.mean(token_embeddings, dim=0)
+
+            pooled_embeddings.append(pooled_embedding)
+
+        return pooled_embeddings
 
     def get_keyword_emb(self,
                         keywords: List[List[str]],
@@ -790,7 +883,7 @@ class ContextualRAG:
 
         # Step 3: Generate full chunk embeddings (for the chunk database)
         print("Generating full chunk embeddings...")
-        full_chunk_embeddings = self.get_full_chunk_embeddings(chunks)
+        full_chunk_embeddings = self.get_full_chunk_embeddings(chunk_embeddings)
 
         # Step 4: Generate keyword embeddings with context
         print("Generating keyword embeddings...")
@@ -946,40 +1039,39 @@ class ContextualRAG:
         # Combine unigrams and bigrams
         query_terms = list(set(query_keywords + query_bigrams))
         return query_terms
-    
+
     def get_query_embedding(self,
-                            query: str
+                            query: str,
+                            pooling_strategy: str="mean"
     ) -> np.ndarray:
         """
-        Generate an embedding for a query.
-        
+        Generate an embedding for a query using the embedding model and pooling strategy.
+
         Args:
             query: Query text
-            
+            pooling_strategy: Strategy to use for pooling. Options:
+                             - "mean": Use mean of all token embeddings
+                             - "pooler": Use the model's pooler_output (if available)
+                             - "cls": Use the CLS token embedding
+
+
         Returns:
-            Normalized query embedding
+            Normalized query embedding as a numpy array
         """
-        # Tokenize the query
-        inputs = self.tokenizer(
-            query, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=512
-        ).to(self.device)
-        
-        # Generate embedding
-        with torch.no_grad():
-            outputs = self.embedding_model(**inputs)
-            
-            # Use pooler output or mean of last hidden state
-            if hasattr(outputs, 'pooler_output'):
-                query_embedding = outputs.pooler_output[0].cpu().numpy()
-            else:
-                query_embedding = outputs.last_hidden_state[0].mean(dim=0).cpu().numpy()
-        
-        # Normalize the embedding
-        return normalize(query_embedding.reshape(1, -1)).astype('float32')
+        # Step 1: Get token-level embeddings using _get_embedding
+        token_embeddings_np, _ = self._get_embedding(query, normalize=True)
+
+        # Convert numpy array to torch tensor for pooling
+        token_embeddings = torch.tensor(token_embeddings_np)
+
+        # Step 2: Pool token embeddings to get a single vector using _pooler_embeddings
+        # We put the tensor in a list since _pooler_embeddings expects a list of tensors
+        pooled_embedding = self._pooler_embeddings([token_embeddings], pooling_strategy)[0]
+
+        # Convert to numpy array and ensure correct shape and type
+        query_embedding = pooled_embedding.cpu().numpy().reshape(1, -1).astype('float32')
+
+        return query_embedding
 
     def process_query(self,
                       query: str,
@@ -1013,8 +1105,8 @@ class ContextualRAG:
                   f"chunk={chunk_weight}, keyword_chunk={keyword_chunk_weight}")
 
         # Calculate number of results to retrieve from each database
-        keyword_count = max(1, int(round(top_k * keyword_weight))) if keyword_weight > 0 else 0
-        chunk_count = max(1, int(round(top_k * chunk_weight))) if chunk_weight > 0 else 0
+        keyword_count = max(1, int(top_k * keyword_weight)) if keyword_weight > 0 else 0
+        chunk_count = max(1, int(top_k * chunk_weight)) if chunk_weight > 0 else 0
         keyword_chunk_count = max(1, top_k - keyword_count - chunk_count)
 
         # Adjust counts if necessary to ensure we get exactly top_k results
@@ -1056,7 +1148,7 @@ class ContextualRAG:
             print(f"Searching keyword database with {len(query_terms)} query terms...")
 
             # Get keyword embeddings for query terms
-            query_keyword_embeddings = self.get_query_keyword_emb(query_terms)
+            query_keyword_embeddings = self.get_query_keyword_emb(query_terms, query)
 
             # Search each keyword embedding against the keyword database
             keyword_results = []
@@ -1114,7 +1206,7 @@ class ContextualRAG:
             print("Searching keyword-chunk database...")
 
             # Generate keyword-based query embedding
-            query_keyword_chunk_emb = self.get_query_keyword_chunk_emb(query)
+            query_keyword_chunk_emb = self.get_query_keyword_chunk_emb(query_terms, query)
 
             # Search query embedding against keyword-chunk database
             keyword_chunk_results = self.search_keyword_chunk_db(query_keyword_chunk_emb, top_k=keyword_chunk_count)
@@ -1372,84 +1464,68 @@ class ContextualRAG:
         # Return top_k results
         return results[:top_k]
 
-    def get_query_keyword_chunk_emb(self, query):
+    def get_query_keyword_chunk_emb(self,
+                                    query_terms: List[str],
+                                    query: str = None,
+                                    pooling_strategy: str = "mean"
+    ) -> np.ndarray:
         """
-        Generate an embedding for the query that's compatible with the keyword-chunk approach.
-        This method extracts keywords from the query and creates an embedding based on them.
+        Generate a pooled embedding for query keywords, optionally with query context.
+
+        This method first generates embeddings for each keyword in the query and then
+        pools them together using the specified pooling strategy.
 
         Args:
-            query: The query string
+            query_terms: List of keywords extracted from the query
+            query: Optional full query text for context
+            pooling_strategy: Strategy for pooling keyword embeddings ("mean", "max", etc.)
 
         Returns:
-            Query embedding as a numpy array
+            A single pooled embedding vector representing the entire query
         """
-        # Extract keywords from the query
-        query_terms = self.extract_query_terms(query)
-
-        # If no keywords were found, return a regular query embedding
+        # Early return for empty query terms
         if not query_terms:
-            print("No keywords found in query. Using full query embedding.")
-            return self.get_query_embedding(query)
-
-        # Get the dimension for the embedding
-        if hasattr(self, 'keyword_chunk_embeddings') and len(self.keyword_chunk_embeddings) > 0:
-            # Use the same dimension as the keyword-chunk embeddings
-            if isinstance(self.keyword_chunk_embeddings, list):
-                # If it's a list, use the first element's shape
-                if len(self.keyword_chunk_embeddings) > 0:
-                    dim = len(self.keyword_chunk_embeddings[0])
-                else:
-                    dim = 768  # Default dimension
+            # Determine appropriate dimension for empty case
+            if hasattr(self, 'embedding_dim'):
+                dim = self.embedding_dim
+            elif hasattr(self, 'chunk_embeddings') and self.chunk_embeddings is not None:
+                dim = self.chunk_embeddings.shape[1]
             else:
-                # If it's a numpy array, use its second dimension
-                dim = self.keyword_chunk_embeddings.shape[1]
+                # Default dimension if we can't determine it
+                dim = 768
+            return np.zeros((1, dim), dtype='float32')
+
+        # Step 1: Get embeddings for each keyword
+        keyword_embeddings_dict = self.get_query_keyword_emb(query_terms, query)
+
+        # Step 2: Convert dictionary of embeddings to list of tensors for pooling
+        keyword_embeddings_list = []
+        for keyword, embedding in keyword_embeddings_dict.items():
+            # Convert numpy array to torch tensor
+            embedding_tensor = torch.tensor(embedding.squeeze())
+            keyword_embeddings_list.append(embedding_tensor)
+
+        # Step 3: Directly calculate mean of keyword embeddings instead of using _pooler_embeddings
+        if len(keyword_embeddings_list) > 0:
+            # Convert list of embeddings to a tensor if needed
+            if isinstance(keyword_embeddings_list[0], torch.Tensor):
+                # Stack tensors along dimension 0
+                stacked_embeddings = torch.stack(keyword_embeddings_list, dim=0)
+                # Calculate mean along dimension 0
+                pooled_embedding = torch.mean(stacked_embeddings, dim=0)
+            else:
+                # If not tensors, convert to tensor first
+                keyword_embeddings_tensor = torch.tensor(keyword_embeddings_list)
+                pooled_embedding = torch.mean(keyword_embeddings_tensor, dim=0)
+
+            # Step 4: Convert the pooled embedding to numpy and reshape
+            pooled_embedding_np = pooled_embedding.cpu().numpy().reshape(1, -1).astype('float32')
+            return pooled_embedding_np
         else:
-            # Default dimension if keyword_chunk_embeddings is not available
-            dim = 768
-
-        # Initialize query embedding
-        query_emb = np.zeros((1, dim), dtype=np.float32)
-
-        # Get embeddings for each keyword and combine them
-        keyword_count = 0
-        for keyword in query_terms:
-            try:
-                # Tokenize the text
-                inputs = self.tokenizer(
-                    f"{keyword}: {query}",  # Include both keyword and query for context
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                ).to(self.device)
-
-                # Generate embedding using the model
-                with torch.no_grad():
-                    outputs = self.embedding_model(**inputs)
-
-                    # Use pooler output or mean of last hidden state
-                    if hasattr(outputs, 'pooler_output'):
-                        keyword_emb = outputs.pooler_output[0].cpu().numpy()
-                    else:
-                        keyword_emb = outputs.last_hidden_state[0].mean(dim=0).cpu().numpy()
-
-                    # Add to the query embedding
-                    query_emb += keyword_emb
-                    keyword_count += 1
-
-            except Exception as e:
-                print(f"Error generating embedding for keyword '{keyword}': {e}")
-
-        # Average the embeddings if we have any
-        if keyword_count > 0:
-            query_emb /= keyword_count
-        else:
-            # If all keywords failed, fall back to the full query embedding
-            print("Failed to generate keyword embeddings. Using full query embedding.")
-            query_emb = self.get_query_embedding(query)
-
-        # Normalize the embedding
-        return normalize(query_emb)
+            # Handle the case when there are no embeddings
+            # Return an appropriate default value or raise an error
+            raise ValueError("No keyword embeddings available to pool")
+            return np.zeros((1, dim), dtype='float32')
 
     def get_all_unique_keywords(self) -> Dict[str, Dict[str, int]]:
         """
@@ -1795,36 +1871,115 @@ class ContextualRAG:
 
 
 def main():
-    """Example usage of the ContextualRAG system."""
-    # Initialize the RAG system
-    rag = ContextualRAG()
+    """
+    Main entry point for the Contextual RAG application.
 
-    # Process PDF files
-    chunks, chunk_metadata = rag.upload_files("path/to/pdfs")
+    This function demonstrates the workflow for creating, training, and using
+    a Contextual Retrieval Augmented Generation (RAG) system:
+    1. Initialize the ContextualRAG with appropriate parameters
+    2. Upload and process documents
+    3. Create the knowledge database
+    4. Process queries against the knowledge base
+    5. Save the model for future use
 
-    # Create vector databases for keywords and chunks  and keyword-chunk embeddings
-    rag.make_db(chunks, chunk_metadata)
+    Returns:
+        None
+    """
+    import os
+    import time
+    import torch
+    from pathlib import Path
 
-    # Save the system
-    rag.save("path/to/save/rag_system")
+    # Define configuration parameters
+    config = {
+        # Model parameters
+        "chunk_size": 1000,  # Size of text chunks for processing
+        "chunk_overlap": 200,  # Overlap between chunks to maintain context
+        "context_window": 200,  # Size of context window for keywords
+        "embedding_model_name": "BAAI/bge-base-en-v1.5",  # Model for embeddings
+        "device": "cuda" if torch.cuda.is_available() else "cpu",  # Use GPU if available
 
-    # Example query - search across all documents with hybrid approach
-    query = "What is machine learning?"
-    results = rag.process_query(
-        query,
-        top_k=5,
-        keyword_weight=0.7,  # Emphasize keyword matches
-        chunk_weight=0.3  # But also consider whole-chunk similarity
+        # File paths
+        "docs_dir": Path("./documents"),  # Directory containing source documents
+        "model_path": Path("./rag_model"),  # Directory to save/load the RAG model
+
+        # Query parameters
+        "top_k": 10,  # Number of top results to return for each query
+    }
+
+    # Initialize the ContextualRAG system
+    print("Initializing ContextualRAG system...")
+    rag = ContextualRAG(
+        chunk_size=config["chunk_size"],
+        chunk_overlap=config["chunk_overlap"],
+        context_window=config["context_window"],
+        embedding_model_name=config["embedding_model_name"],
+        device=config["device"]
     )
 
-    print("\nHybrid Query Results:")
-    for i, result in enumerate(results):
-        print(f"\nResult {i + 1} (Score: {result['score']:.4f}):")
-        print(f"Document ID: {result['doc_id']}")
-        print(f"Page: {result['page_num']}")
-        print(f"Keywords: {', '.join(result['keywords'])}")
-        print(f"Relevant terms: {', '.join(result['relevant_terms'])}")
-        print(f"Text: {result['chunk_text'][:200]}...")
+    # Check if a saved model exists
+    if config["model_path"].exists():
+        print(f"Loading existing model from {config['model_path']}...")
+        rag.load(config["model_path"])
+    else:
+        # Process documents if no model exists
+        if not config["docs_dir"].exists():
+            print(f"Document directory {config['docs_dir']} not found!")
+            return
+
+        # Upload and process documents
+        print(f"Processing documents from {config['docs_dir']}...")
+        start_time = time.time()
+        document_files = [str(f) for f in config["docs_dir"].glob("**/*")
+                          if f.is_file() and f.suffix in ['.txt', '.pdf', '.docx']]
+
+        if not document_files:
+            print("No documents found to process!")
+            return
+
+        rag.upload_files(document_files)
+
+        # Create knowledge database
+        print("Building knowledge database...")
+        rag.make_db()
+
+        # Save the model for future use
+        print(f"Saving model to {config['model_path']}...")
+        rag.save(config["model_path"])
+
+        elapsed_time = time.time() - start_time
+        print(f"Processing completed in {elapsed_time:.2f} seconds")
+
+    # Interactive query loop
+    print("\nContextual RAG system ready for queries (type 'exit' to quit)")
+    while True:
+        query = input("\nEnter your query: ")
+
+        if query.lower() in ['exit', 'quit']:
+            break
+
+        if not query.strip():
+            continue
+
+        # Process the query and get results
+        start_time = time.time()
+        results = rag.process_query(query, top_k=config["top_k"])
+        elapsed_time = time.time() - start_time
+
+        # Display results
+        print(f"\nResults (retrieved in {elapsed_time:.2f} seconds):")
+
+        if not results:
+            print("No relevant information found.")
+            continue
+
+        for i, result in enumerate(results, 1):
+            print(f"\n{i}. Document: {result.get('doc_id', 'Unknown')}")
+            print(f"   Score: {result.get('score', 0):.4f}")
+            print(f"   Context: {result.get('text', '')[:200]}...")
+
+    print("Exiting Contextual RAG system.")
+
 
 if __name__ == "__main__":
     main()
