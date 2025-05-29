@@ -101,9 +101,9 @@ class ContextualRAG:
 
         # Define a vectorizer for keyword extraction
         self.vectorizer = TfidfVectorizer(
-            max_features=100,
-            max_df=0.85,
-            min_df=2,
+            max_features=1000,
+            max_df=0.75,
+            min_df=1,
             stop_words='english',
             use_idf=True,
             ngram_range=(1, 2)
